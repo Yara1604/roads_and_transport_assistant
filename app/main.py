@@ -1,28 +1,190 @@
-from fastapi import FastAPI
+from pathlib import Path
+from typing import Any, Literal
+import time
+import sqlite3
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException
+from langchain_chroma import Chroma
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.sqlite import SqliteSaver
+from pydantic import BaseModel, Field
+
+from langchain_huggingface import HuggingFaceEmbeddings
+
+from graph import create_graph
+from ingestion import chunk_documents, load_documents
+from retrieval import create_bm25_retriever, lexical_search, rrf, semantic_search
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SOURCE_DIR = PROJECT_ROOT / "data" / "raw" / "pdf"
+DEFAULT_PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+DEFAULT_CHROMA_DIR = PROJECT_ROOT / "chroma_langchain_db"
+CHECKPOINT_DB_PATH = PROJECT_ROOT / "chat_checkpoints.sqlite"
 
 
-@app.get("/health") # report app readiness & index availability
+class IngestRequest(BaseModel):
+    source_folder: str = str(DEFAULT_SOURCE_DIR)
+    processed_folder: str = str(DEFAULT_PROCESSED_DIR)
+    max_tokens: int = Field(default=512, ge=1)
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1)
+    mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
+    filters: dict[str, Any] | None = None
+    top_k: int = Field(default=5, ge=1, le=50)
+
+
+class ChatRequest(BaseModel):
+    thread_id: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
+    filters: dict[str, Any] | None = None
+    top_k: int = Field(default=5, ge=1, le=50)
+
+
+class ResumeRequest(BaseModel):
+    thread_id: str
+    clarification: str = Field(min_length=1)
+
+
+app = FastAPI(title="Roads and Transport Assistant")
+app.state.documents = []
+app.state.vector_store = None
+app.state.graph = None
+app.state.checkpoint_connection = sqlite3.connect(
+    CHECKPOINT_DB_PATH, check_same_thread=False
+)
+app.state.checkpointer = SqliteSaver(app.state.checkpoint_connection)
+app.state.checkpointer.setup()
+
+
+def _serialize_document(document):
+    return {"content": document.page_content, "metadata": document.metadata}
+
+
+def _require_index():
+    if not app.state.documents or app.state.vector_store is None:
+        raise HTTPException(
+            status_code=409, detail="No corpus is indexed. Call /ingest first."
+        )
+
+
+def _search(request: SearchRequest):
+    _require_index()
+    candidate_k = max(request.top_k * 3, 10)
+
+    lexical_results = []
+    semantic_results = []
+    if request.mode in {"lexical", "hybrid"}:
+        retriever = create_bm25_retriever(app.state.documents, k=candidate_k)
+        lexical_results = lexical_search(request.query, retriever, k=candidate_k)
+    if request.mode in {"semantic", "hybrid"}:
+        semantic_results = semantic_search(
+            request.query,
+            app.state.vector_store,
+            k=candidate_k,
+            filters=request.filters,
+        )
+
+    if request.mode == "hybrid":
+        results, _ = rrf(lexical_results, semantic_results)
+    else:
+        results = lexical_results or semantic_results
+    return results[: request.top_k]
+
+
+@app.get("/health")  # report app readiness & index availability
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "indexed_chunks": len(app.state.documents)}
 
 
-@app.post("/ingest") # ingest the approved local corpus, return indexed, skipped, and failed docs counts & errors
-def ingest(): # This will be async
-    pass
+@app.post(
+    "/ingest"
+)  # ingest the approved local corpus, return indexed, skipped, and failed docs counts & errors
+def ingest(request: IngestRequest):
+    loaded = load_documents(request.source_folder, request.processed_folder)
+    chunks = chunk_documents(loaded, max_tokens=request.max_tokens)
+    if not chunks:
+        raise HTTPException(
+            status_code=400, detail="No chunks were created from the supplied corpus."
+        )
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-mpnet-base-v2",
+          model_kwargs={"device": "cpu"},
+          encode_kwargs={
+              "normalize_embeddings": True,
+              "batch_size": 8
+          }
+    )
+    vector_store = Chroma(
+        collection_name="road_and_transport_collection",
+        embedding_function=embeddings,
+        persist_directory=str(DEFAULT_CHROMA_DIR),
+    )
+
+    # Chroma persists across application runs. Reuse its stored chunk IDs so
+    # repeated ingestion only embeds and inserts chunks that are not indexed yet.
+    existing_ids = set(vector_store._collection.get(include=["metadatas"])["ids"])
+    new_chunks = [
+        chunk for chunk in chunks if chunk.metadata["chunk_id"] not in existing_ids
+    ]
+
+    if new_chunks:
+        vector_store.add_documents(
+            documents=new_chunks,
+            ids=[chunk.metadata["chunk_id"] for chunk in new_chunks],
+        )
+
+    app.state.documents = chunks
+    app.state.vector_store = vector_store
+    app.state.graph = create_graph(chunks, vector_store, app.state.checkpointer)
+    return {
+        "indexed_documents": len(loaded),
+        "indexed_chunks": len(chunks),
+        "added_chunks": len(new_chunks),
+        "skipped_chunks": len(chunks) - len(new_chunks),
+    }
 
 
-@app.post("/search") # accept query, mode, optional metadata filters, top_k. return ranked chunks + source metadata
-def search():
-    pass
+@app.post(
+    "/search"
+)  # accept query, mode, optional metadata filters, top_k. return ranked chunks + source metadata
+def search(request: SearchRequest):
+    return {"results": [_serialize_document(doc) for doc in _search(request)]}
 
 
-@app.post("/chat") # accept thread_id, message, search mode and optional filters. return answer
-def chat():
-    pass
+@app.post(
+    "/chat"
+)  # accept thread_id, message, search mode and optional filters. return answer
+def chat(request: ChatRequest):
+    _require_index()
+    state = app.state.graph.invoke(
+        {
+            "question": request.message,
+            "search_mode": request.mode,
+            "filters": request.filters,
+            "candidate_k": max(request.top_k * 3, 10),
+            "top_k": request.top_k,
+            "messages": [HumanMessage(content=request.message)],
+        },
+        config={"configurable": {"thread_id": request.thread_id}},
+    )
+    evidence = state.get("reranked_results", [])
+    return {
+        "thread_id": request.thread_id,
+        "answer": state.get("answer"),
+        "sources": [_serialize_document(doc) for doc in evidence],
+    }
 
 
-@app.post("/chat/resume") # accept thread_id, interrupt identified (if required), clarification text, resume pending paragraph execution, reject invalid/non-pending resumes
-def resume_chat():
-    pass
+@app.post(
+    "/chat/resume"
+)  # accept thread_id, interrupt identified (if required), clarification text, resume pending paragraph execution, reject invalid/non-pending resumes
+def resume_chat(request: ResumeRequest):
+    raise HTTPException(
+        status_code=501,
+        detail="Chat resume is unavailable until the graph adds an interrupt point.",
+    )
