@@ -12,42 +12,12 @@ from pydantic import BaseModel, Field
 
 from langchain_huggingface import HuggingFaceEmbeddings
 
-from graph import create_graph
-from ingestion import chunk_documents, load_documents
-from retrieval import create_bm25_retriever, lexical_search, rrf, semantic_search
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SOURCE_DIR = PROJECT_ROOT / "data" / "raw" / "pdf"
-DEFAULT_PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-DEFAULT_CHROMA_DIR = PROJECT_ROOT / "chroma_langchain_db"
-CHECKPOINT_DB_PATH = PROJECT_ROOT / "chat_checkpoints.sqlite"
-
-
-class IngestRequest(BaseModel):
-    source_folder: str = str(DEFAULT_SOURCE_DIR)
-    processed_folder: str = str(DEFAULT_PROCESSED_DIR)
-    max_tokens: int = Field(default=512, ge=1)
-
-
-class SearchRequest(BaseModel):
-    query: str = Field(min_length=1)
-    mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
-    filters: dict[str, Any] | None = None
-    top_k: int = Field(default=5, ge=1, le=50)
-
-
-class ChatRequest(BaseModel):
-    thread_id: str = Field(min_length=1)
-    message: str = Field(min_length=1)
-    mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
-    filters: dict[str, Any] | None = None
-    top_k: int = Field(default=5, ge=1, le=50)
-
-
-class ResumeRequest(BaseModel):
-    thread_id: str
-    clarification: str = Field(min_length=1)
-
+from app.config import CHECKPOINT_DB_PATH
+from app.config import DEFAULT_CHROMA_DIR
+from app.schemas import IngestRequest, SearchRequest, ChatRequest, ResumeRequest
+from app.graph import create_graph
+from app.ingestion import chunk_documents, load_documents
+from app.retrieval import create_bm25_retriever, lexical_search, rrf, semantic_search
 
 app = FastAPI(title="Roads and Transport Assistant")
 app.state.documents = []
@@ -100,9 +70,7 @@ def health():
     return {"status": "ok", "indexed_chunks": len(app.state.documents)}
 
 
-@app.post(
-    "/ingest"
-)  # ingest the approved local corpus, return indexed, skipped, and failed docs counts & errors
+@app.post("/ingest")  # ingest the approved local corpus, return indexed, skipped, and failed docs counts & errors
 def ingest(request: IngestRequest):
     loaded = load_documents(request.source_folder, request.processed_folder)
     chunks = chunk_documents(loaded, max_tokens=request.max_tokens)
@@ -149,16 +117,14 @@ def ingest(request: IngestRequest):
     }
 
 
-@app.post(
-    "/search"
-)  # accept query, mode, optional metadata filters, top_k. return ranked chunks + source metadata
+@app.post("/search")
+# accept query, mode, optional metadata filters, top_k. return ranked chunks + source metadata
 def search(request: SearchRequest):
     return {"results": [_serialize_document(doc) for doc in _search(request)]}
 
 
-@app.post(
-    "/chat"
-)  # accept thread_id, message, search mode and optional filters. return answer
+@app.post("/chat")
+# accept thread_id, message, search mode and optional filters. return answer
 def chat(request: ChatRequest):
     _require_index()
     state = app.state.graph.invoke(

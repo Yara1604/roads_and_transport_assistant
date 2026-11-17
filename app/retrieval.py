@@ -1,7 +1,8 @@
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
-from models import llm
+from app.models import llm
 from langchain_community.retrievers import BM25Retriever
+from app.schemas import RerankedItem, RerankResult
 
 
 def create_bm25_retriever(documents: list[Document], k: int = 10) -> BM25Retriever:
@@ -30,7 +31,6 @@ def semantic_search(
 
 
 # RRF (Reciprocal Rank Fusion)
-
 
 def rrf(
     bm25_results: list[Document], vector_results: list[Document], rrf_k: int = 60
@@ -71,18 +71,7 @@ def rrf(
     return fused_documents, sorted_rrf_scores
 
 
-# For reranking using gemini, its schema constrained output
-class RerankedItem(BaseModel):
-    chunk_id: str
-    relevance_score: float = Field(ge=0, le=10)
-
-
-class RerankResult(BaseModel):
-    results: list[RerankedItem]
-
-
 reranker_llm = llm.with_structured_output(RerankResult)
-
 
 def rerank_documents(
     query: str, documents: list[Document], top_k: int = 5

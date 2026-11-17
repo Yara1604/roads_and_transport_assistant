@@ -95,7 +95,7 @@ def chunk_documents(documents: list[dict], max_tokens: int = 512) -> list[Docume
         for j, chunk in enumerate(chunk_iter):
             text = chunker.contextualize(chunk)
 
-            chunk_id = f"{document_id}_{j}"
+            chunk_id = f"{title}_{j}"
 
             # page number
             page = None

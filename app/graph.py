@@ -1,16 +1,17 @@
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import AIMessage
+from langgraph.types import interrupt, Command
 
-from schemas import GraphState
-from retrieval import (
+from app.schemas import GraphState, ClassificationResult
+from app.retrieval import (
     create_bm25_retriever,
     lexical_search,
     semantic_search,
     rrf,
     rerank_documents,
 )
-from models import llm
-from prompts import answer_prompt
+from app.models import llm
+from app.prompts import answer_prompt, interruption_prompt
 
 def create_graph(
         langchain_docs,
@@ -76,6 +77,23 @@ def create_graph(
             "reranked_results": reranked_docs
         }
 
+    def query_classification_node(state: GraphState):
+        query = state.question
+        context = "\n\n".join(doc.page_content for doc in state.reranked_results)
+                # if not context:
+                #     answer = "There is insufficient evidence to answer this question."
+                #     return {"context": "", "answer": answer, "messages": [AIMessage(content=answer)]}
+
+        classifier_llm = llm.with_structured_output(ClassificationResult)
+
+        classification = (interruption_prompt | classifier_llm).invoke(
+            {
+                "context": context,
+                "question": state.question
+            })
+
+        
+
     def answer_node(state: GraphState):
         context = "\n\n".join(doc.page_content for doc in state.reranked_results)
         if not context:
@@ -84,7 +102,7 @@ def create_graph(
 
         history = "\n".join(
             f"{message.type}: {message.content}"
-            for message in state.messages[-10:-1]
+            for message in state.messages[-10:-1] # Last 10 messages
         ) or "No previous conversation."
 
         response = (answer_prompt | llm).invoke(
