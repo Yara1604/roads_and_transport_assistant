@@ -120,7 +120,10 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
             clarification_reply = interrupt(state.clarification_question)
             return {
                         "question": f"{state.question}\nAdditional detail:{clarification_reply}",
-                        "messages": [HumanMessage(content=clarification_reply)],
+                        "messages": [
+                            AIMessage(content=state.clarification_question),
+                            HumanMessage(content=clarification_reply),
+                        ],
                         "clarification_questions_asked": state.clarification_questions_asked + 1,
                         "clarification_limit_reached": False,
                     }
