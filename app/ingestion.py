@@ -1,4 +1,4 @@
-import glob
+import csv
 import json
 import re
 from pathlib import Path
@@ -10,9 +10,65 @@ from langchain_core.documents import Document
 import pandas as pd
 
 
-def load_documents(source_folder: str, processed_folder: str | None = None) -> list[dict]:
+def load_documents(
+    source_folder: str,
+    processed_folder: str | None = None,
+    manifest_path: str | None = None,
+) -> list[dict]:
 
-    pdf_paths = glob.glob(str(Path(source_folder) / "*.pdf"))
+    pdf_paths = sorted(Path(source_folder).glob("*.pdf"))
+
+    manifest_by_filename = None
+    if manifest_path is not None:
+        manifest_file = Path(manifest_path)
+        if not manifest_file.is_file():
+            raise FileNotFoundError(f"Manifest not found: {manifest_file}")
+
+        with manifest_file.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            required_columns = {
+                "document_id",
+                "title",
+                "local_file",
+                "primary_category",
+            }
+            missing_columns = required_columns - set(reader.fieldnames or [])
+            if missing_columns:
+                raise ValueError(
+                    "Manifest is missing required columns: "
+                    + ", ".join(sorted(missing_columns))
+                )
+
+            manifest_by_filename = {}
+            for row in reader:
+                if row["primary_category"] != "Roads and Transport":
+                    raise ValueError(
+                        "Manifest document must have primary_category exactly "
+                        "'Roads and Transport': "
+                        f"{row['local_file']} has {row['primary_category']!r}"
+                    )
+
+                filename = Path(row["local_file"]).name
+                if filename in manifest_by_filename:
+                    raise ValueError(
+                        f"Manifest contains more than one row for {filename}"
+                    )
+                manifest_by_filename[filename] = row
+
+        pdf_filenames = {pdf_path.name for pdf_path in pdf_paths}
+        missing_pdfs = sorted(set(manifest_by_filename) - pdf_filenames)
+        if missing_pdfs:
+            raise FileNotFoundError(
+                "Manifest entries have no matching PDF in the source folder: "
+                + ", ".join(missing_pdfs)
+            )
+
+        unlisted_pdfs = sorted(pdf_filenames - set(manifest_by_filename))
+        if unlisted_pdfs:
+            print(
+                "Excluding PDFs not listed in the manifest: "
+                + ", ".join(unlisted_pdfs)
+            )
 
     documents = []
 
@@ -20,9 +76,21 @@ def load_documents(source_folder: str, processed_folder: str | None = None) -> l
     processed_dir.mkdir(parents=True, exist_ok=True)
     converter: DocumentConverter | None = None
 
-    for document_id, pdf in enumerate(pdf_paths):
-        pdf_path = Path(pdf)
-        title = pdf_path.stem
+    for fallback_document_id, pdf_path in enumerate(pdf_paths):
+        manifest_entry = (
+            manifest_by_filename.get(pdf_path.name)
+            if manifest_by_filename is not None
+            else None
+        )
+        if manifest_by_filename is not None and manifest_entry is None:
+            continue
+
+        title = manifest_entry["title"] if manifest_entry else pdf_path.stem
+        document_id = (
+            manifest_entry["document_id"]
+            if manifest_entry
+            else fallback_document_id
+        )
 
         processed_path = processed_dir / f"{title}.json"
 
@@ -49,6 +117,7 @@ def load_documents(source_folder: str, processed_folder: str | None = None) -> l
                 "document_id": document_id,
                 "title": title,
                 "source_file": str(pdf_path),
+                "manifest": manifest_entry,
             }
         )
 

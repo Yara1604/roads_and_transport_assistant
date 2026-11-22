@@ -5,25 +5,73 @@ from langchain_community.retrievers import BM25Retriever
 from app.schemas import RerankedItem, RerankResult
 
 
+def _matches_metadata_filters(metadata: dict, filters: dict | None) -> bool:
+    if not filters:
+        return True
+
+    # The app-facing format is {field: exact_value}; multiple fields are ANDed.
+    _validate_simple_filters(filters)
+    return all(metadata.get(key) == value for key, value in filters.items())
+
+
+def _validate_simple_filters(filters: dict) -> None:
+    for key, value in filters.items():
+        if key.startswith("$") or isinstance(value, (dict, list)) or value is None:
+            raise ValueError(
+                "Filters must use simple field:value equality, "
+                "for example {'year': 2023, 'type': 'Law'}"
+            )
+
+
+def _normalize_chroma_filter(filters: dict | None) -> dict | None:
+    if not filters:
+        return None
+
+    _validate_simple_filters(filters)
+
+    # Chroma expects multiple metadata conditions to be joined explicitly.
+    if len(filters) > 1:
+        return {"$and": [{key: value} for key, value in filters.items()]}
+    return filters
+
+
 def create_bm25_retriever(documents: list[Document], k: int = 10) -> BM25Retriever:
     retriever = BM25Retriever.from_documents(documents=documents, k=k)
     return retriever
 
 
-def lexical_search(query: str, bm25_retriever, k: int = 10) -> list[Document]:
-    bm25_retriever.k = k
+def lexical_search(
+    query: str,
+    bm25_retriever,
+    k: int = 10,
+    filters: dict | None = None,
+) -> list[Document]:
+    # Rank the full corpus first so filtered-out high-ranking documents do not
+    # prevent eligible documents from filling the requested top-k.
+    ranked_retriever = bm25_retriever.model_copy(
+        update={"k": len(bm25_retriever.docs)}
+    )
+    ranked_results = ranked_retriever.invoke(query)
 
-    results = bm25_retriever.invoke(query)
+    if filters:
+        ranked_results = [
+            doc
+            for doc in ranked_results
+            if _matches_metadata_filters(doc.metadata, filters)
+        ]
 
-    return results
+    return ranked_results[:k]
 
 
 def semantic_search(
     query: str, vector_store, k: int = 10, filters: dict | None = None
 ) -> list[Document]:
 
-    if filters:
-        results = vector_store.similarity_search(query=query, k=k, filter=filters)
+    chroma_filter = _normalize_chroma_filter(filters)
+    if chroma_filter:
+        results = vector_store.similarity_search(
+            query=query, k=k, filter=chroma_filter
+        )
     else:
         results = vector_store.similarity_search(query=query, k=k)
 

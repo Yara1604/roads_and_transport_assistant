@@ -8,6 +8,7 @@ from langchain_chroma import Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -49,7 +50,12 @@ def _search(request: SearchRequest):
     semantic_results = []
     if request.mode in {"lexical", "hybrid"}:
         retriever = create_bm25_retriever(app.state.documents, k=candidate_k)
-        lexical_results = lexical_search(request.query, retriever, k=candidate_k)
+        lexical_results = lexical_search(
+            request.query,
+            retriever,
+            k=candidate_k,
+            filters=request.filters,
+        )
     if request.mode in {"semantic", "hybrid"}:
         semantic_results = semantic_search(
             request.query,
@@ -70,9 +76,14 @@ def health():
     return {"status": "ok", "indexed_chunks": len(app.state.documents)}
 
 
-@app.post("/ingest")  # ingest the approved local corpus, return indexed, skipped, and failed docs counts & errors
+@app.post("/ingest")  # ingest corpus, return indexed, skipped, and failed counts
 def ingest(request: IngestRequest):
-    loaded = load_documents(request.source_folder, request.processed_folder)
+    manifest_path = Path(__file__).resolve().parents[1] / "data" / "corpus_manifest.csv"
+    loaded = load_documents(
+        request.source_folder,
+        request.processed_folder,
+        manifest_path=str(manifest_path),
+    )
     chunks = chunk_documents(loaded, max_tokens=request.max_tokens)
     if not chunks:
         raise HTTPException(
@@ -81,11 +92,8 @@ def ingest(request: IngestRequest):
 
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-mpnet-base-v2",
-          model_kwargs={"device": "cpu"},
-          encode_kwargs={
-              "normalize_embeddings": True,
-              "batch_size": 8
-          }
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True, "batch_size": 8},
     )
     vector_store = Chroma(
         collection_name="road_and_transport_collection",
@@ -138,19 +146,37 @@ def chat(request: ChatRequest):
         },
         config={"configurable": {"thread_id": request.thread_id}},
     )
+
     evidence = state.get("reranked_results", [])
+
+    interrupts = state.get("__interrupt__", [])
+    clarification_question = interrupts[0].value if interrupts else None
+
     return {
         "thread_id": request.thread_id,
         "answer": state.get("answer"),
+        "clarification_question": clarification_question,
         "sources": [_serialize_document(doc) for doc in evidence],
     }
 
 
-@app.post(
-    "/chat/resume"
-)  # accept thread_id, interrupt identified (if required), clarification text, resume pending paragraph execution, reject invalid/non-pending resumes
+@app.post("/chat/resume")
+# accept thread_id, interrupt identified (if required), clarification text, resume pending paragraph execution, reject invalid/non-pending resumes
 def resume_chat(request: ResumeRequest):
-    raise HTTPException(
-        status_code=501,
-        detail="Chat resume is unavailable until the graph adds an interrupt point.",
+    _require_index()
+    result = app.state.graph.invoke(
+        Command(resume=request.clarification),
+        config={"configurable": {"thread_id": request.thread_id}},
     )
+
+
+    evidence = result.get("reranked_results", [])
+    
+    interrupts = result.get("__interrupt__", [])
+    clarification_question = interrupts[0].value if interrupts else None
+    return {
+            "thread_id": request.thread_id,
+            "answer": result.get("answer"),
+            "clarification_question": clarification_question,
+            "sources": [_serialize_document(doc) for doc in evidence],
+        }

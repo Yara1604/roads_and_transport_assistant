@@ -11,6 +11,10 @@ answer_prompt = ChatPromptTemplate.from_messages(
     Rules:
         Do not use outside knowledge.
         Do not invent legal facts, requirements, dates, penalties, or citations.
+        Before answering from retrieved evidence, call get_document_excerpt for the
+        relevant chunk using its Document ID and locator `chunk:<chunk_id>` from the evidence.
+        Use the returned excerpt to verify the source text. If no matching excerpt is returned,
+        do not rely on that chunk.
         Preserve important legal and technical details from the evidence.
         If the evidence is insufficient, clearly state that there is insufficient evidence.
         If sources conflict, state the conflict.
@@ -21,7 +25,7 @@ answer_prompt = ChatPromptTemplate.from_messages(
             "human",
             """
     Conversation history (use this only to understand follow-up references; it is not evidence):
-    {chat_history}
+    {history}
 
     Retrieved evidence:
     {context}
@@ -35,31 +39,36 @@ answer_prompt = ChatPromptTemplate.from_messages(
 
 interruption_prompt = ChatPromptTemplate.from_messages(
     [
-        ("system",
-        """
+        (
+            "system",
+            """
         You are a query sufficiency classifier for a Transportation RAG system.
         Your task is to determine whether the user's query can be answered unambiguously using the retrieved document context provided.
         Classify the query as exactly one of:
             clear: The user's intent is sufficiently specific, and the retrieved context provides enough relevant information to determine what the user is asking about.
             requires_clarification: The user's intent is ambiguous, underspecified, or could reasonably refer to multiple different things in the retrieved context.
 
+        If the query is classified as requires_clarification, you must also provide a single clarification question that would help disambiguate the user's intent. The clarification question should be concise, specific, and relevant to the retrieved context. If not, leave it as None.
+        Ground that question in the actual evidence: name the document titles or headings that create the ambiguity, and offer clear choices (including comparing the sources when appropriate). Do not ask a generic "which document?" question when the retrieved context identifies the candidate documents. Do not invent titles or choices.
+
         Rules:
             1. Evaluate the query together with the retrieved document context, not the query alone.
-            2. Do not require clarification simply because the query is short. If the retrieved context makes the intended meaning clear, classify it as clear.
-            3. If multiple plausible interpretations are supported by the retrieved context and choosing one would require an assumption, classify it as requires_clarification.
-            4. If an important entity, location, transportation mode, regulation, route, vehicle type, time period, or other constraint is missing and the context cannot resolve it, classify it as requires_clarification.
-            5. Do not invent missing information or assume what the user meant.
-            6. Do not answer the user's question. Your only task is classification.
-            7. Base the classification only on the user query and the supplied retrieved context.
-        """
-        )
-        ("human",
-        """
+            2. If multiple documents contain conflicting information, classify it as requires_clarification.
+            3. Do not invent missing information or assume what the user meant.
+            4. Do not answer the user's question. Your only task is classification.
+            5. Base the classification on the user query, history, and the supplied retrieved context.
+        """,
+        ),
+        (
+            "human",
+            """
         User query:
-            {query}
+            {question}
         Retrieved document context:
             {context}
-        """
-        )
+        History:
+            {history}
+        """,
+        ),
     ]
 )
