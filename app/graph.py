@@ -250,10 +250,11 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
         )
         logger.info("Chat graph: answer agent finished")
         response = agent_result["messages"][-1]
+        answer_text = response.text
         return {
             "context": context,
-            "answer": response.content,
-            "messages": [AIMessage(content=response.content)],
+            "answer": answer_text,
+            "messages": [AIMessage(content=answer_text)],
             # "history": [AIMessage(content=response.content)],
         }
 

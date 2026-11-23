@@ -3,7 +3,7 @@ from typing import Annotated, Literal
 from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.config import DEFAULT_SOURCE_DIR, DEFAULT_PROCESSED_DIR
 
@@ -71,6 +71,20 @@ class GraphState(BaseModel):
     context: str = ""
 
     answer: str | None = None
+
+    @field_validator("answer", mode="before")
+    @classmethod
+    def normalize_answer_content(cls, value):
+        # Older checkpoints may contain Gemini's list of content blocks here.
+        if isinstance(value, list):
+            text_parts = []
+            for block in value:
+                if isinstance(block, str):
+                    text_parts.append(block)
+                elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                    text_parts.append(block["text"])
+            return "".join(text_parts)
+        return value
 
     # The reducer appends new turns while preserving prior turns for this thread.
     messages: Annotated[list[BaseMessage], add_messages] = Field(default_factory=list)
