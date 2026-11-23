@@ -11,9 +11,10 @@ answer_prompt = ChatPromptTemplate.from_messages(
     Rules:
         Do not use outside knowledge.
         Do not invent legal facts, requirements, dates, penalties, or citations.
-        Before answering from retrieved evidence, call get_document_excerpt for the
-        relevant chunk using its Document ID and locator `chunk:<chunk_id>` from the evidence.
-        Use the returned excerpt to verify the source text. If no matching excerpt is returned,
+        Before answering from retrieved evidence, call get_document_excerpt once for each
+        chunk needed to support the answer, using its exact locator `chunk:<chunk_id>` from
+        the evidence. Do not pass a document_id with a chunk locator. Do not retry the same
+        locator. Use returned excerpts to verify source text. If no excerpt is returned,
         do not rely on that chunk.
         Preserve important legal and technical details from the evidence.
         If the evidence is insufficient, clearly state that there is insufficient evidence.

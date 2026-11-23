@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any, Literal
+import logging
 import time
 import sqlite3
 
@@ -19,6 +20,9 @@ from app.schemas import IngestRequest, SearchRequest, ChatRequest, ResumeRequest
 from app.graph import create_graph
 from app.ingestion import chunk_documents, load_documents
 from app.retrieval import create_bm25_retriever, lexical_search, rrf, semantic_search
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Roads and Transport Assistant")
 app.state.documents = []
@@ -134,6 +138,7 @@ def search(request: SearchRequest):
 @app.post("/chat")
 # accept thread_id, message, search mode and optional filters. return answer
 def chat(request: ChatRequest):
+    logger.info("Received /chat request")
     _require_index()
     state = app.state.graph.invoke(
         {

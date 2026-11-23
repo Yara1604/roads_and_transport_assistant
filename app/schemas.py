@@ -19,7 +19,7 @@ class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
     mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
     filters: MetadataFilters = None
-    top_k: int = Field(default=5, ge=1, le=50)
+    top_k: int = Field(default=5, ge=1, le=20)
 
 
 class ChatRequest(BaseModel):
@@ -36,10 +36,13 @@ class ResumeRequest(BaseModel):
 
 
 class DocumentExcerptToolInput(BaseModel):
-    document_id: str = Field(min_length=1, description="ID of a document in the indexed corpus.")
     locator: str = Field(
         min_length=1,
-        description="Use chunk:<chunk_id> for one chunk or page:<page_number> for a page.",
+        description="Use chunk:<exact_chunk_id> or page:<page_number>.",
+    )
+    document_id: str | None = Field(
+        default=None,
+        description="Required only with a page locator; omit it for a chunk locator.",
     )
 
 

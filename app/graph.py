@@ -1,3 +1,5 @@
+import logging
+
 from langchain.agents import create_agent
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import AIMessage, HumanMessage
@@ -16,33 +18,41 @@ from app.retrieval import (
 from app.models import llm
 from app.prompts import answer_prompt, interruption_prompt
 
+logger = logging.getLogger(__name__)
+
 
 def create_graph(langchain_docs, vector_store, checkpointer=None):
     bm25_retriever = create_bm25_retriever(documents=langchain_docs, k=10)
 
     documents_by_id = {}
+    documents_by_chunk_id = {}
     for document in langchain_docs:
         document_id = str(document.metadata.get("document_id", ""))
         documents_by_id.setdefault(document_id, []).append(document)
+        chunk_id = str(document.metadata.get("chunk_id", ""))
+        documents_by_chunk_id[chunk_id] = document
 
     @tool(args_schema=DocumentExcerptToolInput)
-    def get_document_excerpt(document_id: str, locator: str) -> str:
+    def get_document_excerpt(locator: str, document_id: str | None = None) -> str:
         """Return an excerpt from a page or chunk in the indexed corpus."""
-        document_chunks = documents_by_id.get(document_id, [])
-        if not document_chunks:
-            return "No indexed document matches that document_id."
-
+        logger.info(
+            "Excerpt tool requested locator=%s document_id=%s",
+            locator,
+            document_id,
+        )
         if locator.startswith("chunk:"):
             chunk_id = locator.removeprefix("chunk:")
-            matches = [
-                document
-                for document in document_chunks
-                if document.metadata.get("chunk_id") == chunk_id
-            ]
+            chunk = documents_by_chunk_id.get(chunk_id)
+            matches = [chunk] if chunk is not None else []
         elif locator.startswith("page:"):
             page_number = locator.removeprefix("page:")
             if not page_number.isdigit():
                 return "Invalid page locator. Use page:<page_number>."
+            if document_id is None:
+                return "A document_id is required with a page locator."
+            document_chunks = documents_by_id.get(str(document_id), [])
+            if not document_chunks:
+                return "No indexed document matches that document_id."
             matches = [
                 document
                 for document in document_chunks
@@ -52,7 +62,10 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
             return "Invalid locator. Use chunk:<chunk_id> or page:<page_number>."
 
         if not matches:
-            return "No indexed excerpt matches that document_id and locator."
+            logger.info("Excerpt tool found no match for locator=%s", locator)
+            return "No indexed excerpt matches that locator."
+
+        logger.info("Excerpt tool found %s matching chunk(s)", len(matches))
 
         excerpts = []
         for document in matches:
@@ -60,7 +73,7 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
             headings = metadata.get("headings") or "Not available"
             excerpts.append(
                 f"Document: {metadata.get('filename', 'Unknown title')}\n"
-                f"Document ID: {document_id}\n"
+                f"Document ID: {metadata.get('document_id', 'Unknown')}\n"
                 f"Chunk ID: {metadata.get('chunk_id', 'Unknown chunk')}\n"
                 f"Page: {metadata.get('page', 'Not available')}\n"
                 f"Headings: {headings}\n"
@@ -75,7 +88,15 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
     )
 
     # Nodes
+    def reset_turn_state(state: GraphState):
+        """Reset clarification limits for a new chat turn."""
+        return {
+            "clarification_questions_asked": 0,
+            "clarification_limit_reached": False,
+        }
+
     def query_classification_node(state: GraphState):
+        logger.info("Chat graph: classifying query against %s retrieved chunks", len(state.reranked_results))
         context = "\n\n".join(
             "\n".join(
                 [
@@ -99,6 +120,7 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
                 "history": state.messages[-10:-1] if state.messages else [],
             }
         )
+        logger.info("Chat graph: query classification finished (%s)", result.classification)
         
         return {"classification": result.classification,
                 "clarification_question": result.clarification_question}
@@ -110,6 +132,7 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
 
     def ask_for_clarification(state: GraphState):
         if state.clarification_questions_asked >= MAX_CLARIFICATION_QUESTIONS:
+            logger.info("Chat graph: clarification limit reached")
             answer = "Maximum number of clarification questions reached."
             return {
                         "answer": answer,
@@ -117,6 +140,7 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
                         "clarification_limit_reached": True,
                     }
         else: 
+            logger.info("Chat graph: waiting for clarification reply")
             clarification_reply = interrupt(state.clarification_question)
             return {
                         "question": f"{state.question}\nAdditional detail:{clarification_reply}",
@@ -136,24 +160,28 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
     def bm25_node(state: GraphState):
         if state.search_mode == "semantic":
             return {"bm25_results": []}
+        logger.info("Chat graph: starting lexical retrieval")
         results = lexical_search(
             query=state.question,
             bm25_retriever=bm25_retriever,
             k=state.candidate_k,
             filters=state.filters,
         )
+        logger.info("Chat graph: lexical retrieval finished (%s chunks)", len(results))
 
         return {"bm25_results": results}
 
     def vector_node(state: GraphState):
         if state.search_mode == "lexical":
             return {"vector_results": []}
+        logger.info("Chat graph: starting semantic retrieval")
         results = semantic_search(
             query=state.question,
             vector_store=vector_store,
             k=state.candidate_k,
             filters=state.filters,
         )
+        logger.info("Chat graph: semantic retrieval finished (%s chunks)", len(results))
         return {"vector_results": results}
 
     def fusion_node(state: GraphState):
@@ -167,11 +195,13 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
     def rerank_node(state: GraphState):
         if not state.fused_results:
             return {"reranked_results": []}
+        logger.info("Chat graph: reranking %s candidate chunks", min(len(state.fused_results), 15))
         reranked_docs, _ = rerank_documents(
             query=state.question,
             documents=state.fused_results[:15],
             top_k=state.top_k,
         )
+        logger.info("Chat graph: reranking finished (%s chunks)", len(reranked_docs))
         return {"reranked_results": reranked_docs}
 
     def answer_node(state: GraphState):
@@ -213,7 +243,12 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
                 "history": history,
             }
         ).to_messages()
-        agent_result = answer_agent.invoke({"messages": prompt_messages})
+        logger.info("Chat graph: starting answer agent")
+        agent_result = answer_agent.invoke(
+            {"messages": prompt_messages},
+            config={"recursion_limit": 8},
+        )
+        logger.info("Chat graph: answer agent finished")
         response = agent_result["messages"][-1]
         return {
             "context": context,
@@ -225,14 +260,16 @@ def create_graph(langchain_docs, vector_store, checkpointer=None):
     # Graph
     builder = StateGraph(GraphState)
 
+    builder.add_node("reset_turn_state", reset_turn_state)
     builder.add_node("bm25", bm25_node)
     builder.add_node("vector", vector_node)
     builder.add_node("fusion", fusion_node)
     builder.add_node("rerank", rerank_node)
     
 
-    builder.add_edge(START, "bm25")  # In parallel
-    builder.add_edge(START, "vector")
+    builder.add_edge(START, "reset_turn_state")
+    builder.add_edge("reset_turn_state", "bm25")
+    builder.add_edge("reset_turn_state", "vector")
 
     builder.add_edge("bm25", "fusion")
     builder.add_edge("vector", "fusion")
